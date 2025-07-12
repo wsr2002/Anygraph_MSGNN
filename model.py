@@ -6,6 +6,7 @@ import numpy as np
 from Utils.TimeLogger import log
 from torch.nn import MultiheadAttention
 from time import time
+from model_msgnn import MSGNNExpert
 
 init = nn.init.xavier_uniform_
 uniformInit = nn.init.uniform_
@@ -30,7 +31,7 @@ class FeedForwardLayer(nn.Module):
             return self.linear(embeds)
         return self.act(self.linear(embeds))
 
-class TopoEncoder(nn.Module):
+class TopoEncoder(nn.Module): # formula(6), 2(3)
     def __init__(self):
         super(TopoEncoder, self).__init__()
 
@@ -138,6 +139,7 @@ class Feat_Projector(nn.Module):
 class Adj_Projector(nn.Module):
     def __init__(self, adj):
         super(Adj_Projector, self).__init__()
+        self.register_parameter('_dummy', None)
 
         if args.proj_method == 'adj_svd' or args.proj_method == 'both':
             self.proj_embeds = self.svd_proj(adj)
@@ -163,14 +165,14 @@ class Adj_Projector(nn.Module):
     
     def forward(self):
         return self.proj_embeds
-
+'''
 class Expert(nn.Module):
     def __init__(self):
         super(Expert, self).__init__()
-        
-        self.topo_encoder = TopoEncoder().to(args.devices[0])
+
+        self.topo_encoder = TopoEncoder().to(args.devices[0]) # formula(6), 2(3)
         if args.nn == 'mlp':
-            self.trainable_nn = MLP().to(args.devices[1])
+            self.trainable_nn = MLP().to(args.devices[1]) # 3.2.2, formula(7), 4
         else:
             self.trainable_nn = GraphTransformer().to(args.devices[1])
         self.trn_count = 1
@@ -273,24 +275,42 @@ class Expert(nn.Module):
                 negs = negs[pck_perm]
         t.cuda.empty_cache()
         return score
+'''
+
+
 
 class AnyGraph(nn.Module):
     def __init__(self):
-        super(AnyGraph, self).__init__()
-        self.experts = nn.ModuleList([Expert() for _ in range(args.expert_num)]).cuda()
-        self.opts = list(map(lambda expert: t.optim.Adam(expert.parameters(), lr=args.lr, weight_decay=0), self.experts))
-        
+        super().__init__()
+        self.experts = nn.ModuleList([
+            MSGNNExpert(args, num_input_feat=args.featdim)
+            for _ in range(args.expert_num)
+        ])
+        # 不再创建 self.optims
+        self.assignment = [0] * args.expert_num
+
     def assign_experts(self, handlers, reca=True, log_assignment=False):
+        if len(self.experts) == 0:
+            for i in range(args.expert_num):
+                h = handlers[i % len(handlers)]
+                exp = MSGNNExpert(h, args, num_input_feat=args.featdim).to(args.devices[0])
+                self.experts.append(exp)
+                self.optims.append(
+                    t.optim.Adam(exp.parameters(), lr=args.lr, weight_decay=args.reg)
+                )
+            self.assignment = [i % args.expert_num for i in range(len(handlers))]
+
         if args.expert_num == 1:
             self.assignment = [0] * len(handlers)
             return
         try:
-            expert_scores = np.array(list(map(lambda expert: expert.trn_count, self.experts)))
+            expert_scores = np.array(list(map(lambda expert: expert.trn_count ,self.experts)))
             expert_scores = (1.0 - expert_scores / np.sum(expert_scores)) * args.reca_range + 1.0 - args.reca_range / 2
         except Exception:
             expert_scores = np.ones(len(self.experts))
+
+        assignment = [[] for _ in range(len(handlers))]
         with t.no_grad():
-            assignment = [list() for i in range(len(handlers))]
             for dataset_id, handler in enumerate(handlers):
                 topo_embeds = handler.projectors.to(args.devices[1])
                 for expert_id, expert in enumerate(self.experts):
@@ -310,9 +330,13 @@ class AnyGraph(nn.Module):
                 print('----------\n')
 
             self.assignment = list(map(lambda x: x[0][0], assignment))
+
+        for dataset_id, handler in enumerate(handlers):
+            exp_id = self.assignment[dataset_id]
+            self.experts[exp_id].bind_dataset(handler)
     
     def summon(self, dataset_id):
         return self.experts[self.assignment[dataset_id]]
     
     def summon_opt(self, dataset_id):
-        return self.opts[self.assignment[dataset_id]]
+        return self.optims[self.assignment[dataset_id]]

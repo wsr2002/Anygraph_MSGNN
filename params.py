@@ -3,9 +3,9 @@ import argparse
 def parse_args():
     parser = argparse.ArgumentParser(description='Model Parameters')
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
-    parser.add_argument('--batch', default=4096, type=int, help='training batch size')
+    parser.add_argument('--batch', default=2048, type=int, help='training batch size')
     parser.add_argument('--tst_batch', default=256, type=int, help='testing batch size (number of users)')
-    parser.add_argument('--epoch', default=100, type=int, help='number of epochs')
+    parser.add_argument('--epoch', default=20, type=int, help='number of epochs')
     parser.add_argument('--save_path', default='tem', help='file name to save model and training record')
     parser.add_argument('--load_model', default=None, help='model name to load')
     parser.add_argument('--tst_epoch', default=1, type=int, help='number of epoch to test while training')
@@ -39,5 +39,16 @@ def parse_args():
     parser.add_argument('--nn', default='mlp', type=str, help='what trainable network to use')
     parser.add_argument('--proj_trn_steps', default=100, type=int, help='number of training steps for one initial projection')
     parser.add_argument('--attempt_cache', default=10000000, type=int, help='number of training steps for one initial projection')
+
+    parser.add_argument('--q', type=float, default=0,
+                        help='55 means 0.5/max_{i,j}(A_{i,j} - A_{j,i}), 11, 22, 33 and 44 takes 1/5, 1/5, 3/5, 4/5 of this amount.')
+    parser.add_argument('--K', type=int, default=1)
+    parser.add_argument('--hidden', type=int, default=16)
+    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--trainable_q', action='store_true')
+    parser.add_argument('--dropout', type=float, default=0.5)
+    parser.add_argument('--normalization', type=str, default='sym')
+
     return parser.parse_args()
 args = parse_args()
+

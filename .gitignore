@@ -1,2 +1,9 @@
 extract_code_structure.py
 .DS_Store
+.idea/
+__pycache__/
+Utils/__pycache__/
+History/
+Models/
+zero-shot datasets/
+.gitignore

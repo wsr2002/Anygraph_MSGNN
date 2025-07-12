@@ -14,7 +14,7 @@ def log(msg, save=None, oneline=False):
 	elif saveDefault:
 		logmsg += tem + '\n'
 	if oneline:
-		print(tem, end='\r')
+		print(tem, end='\n', flush=True)
 	else:
 		print(tem)
 

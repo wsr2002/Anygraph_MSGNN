@@ -3,13 +3,14 @@ from torch import nn
 import Utils.TimeLogger as logger
 from Utils.TimeLogger import log
 from params import args
-from model import Expert, Feat_Projector, Adj_Projector, AnyGraph
+from model import Feat_Projector, Adj_Projector, AnyGraph
 from data_handler import MultiDataHandler, DataHandler
 import numpy as np
 import pickle
 import os
 import setproctitle
 import time
+
 
 class Exp:
     def __init__(self, multi_handler):
@@ -54,18 +55,18 @@ class Exp:
             tst_flag = (ep % args.tst_epoch == 0)
             start_time = time.time()
             self.model.assign_experts(self.multi_handler.trn_handlers, reca=True, log_assignment=True)
-            reses = self.train_epoch()
+            reses = self.train_epoch() # Here, train
             log(self.make_print('Train', ep, reses, tst_flag))
             self.multi_handler.remake_initial_projections()
             end_time = time.time()
-            print(f'NOTICE: {end_time-start_time}')
+            print(f'NOTICE: this epoch costs {end_time-start_time} s')
             if tst_flag:
                 for handler_group_id in range(len(self.multi_handler.tst_handlers_group)):
                     tst_handlers = self.multi_handler.tst_handlers_group[handler_group_id]
                     self.model.assign_experts(tst_handlers, reca=False, log_assignment=True)
                     recall, ndcg, tstnum = 0, 0, 0
                     for i, handler in enumerate(tst_handlers):
-                        reses = self.test_epoch(handler, i)
+                        reses = self.test_epoch(handler, i) # Here, test
                         # log(self.make_print(f'{handler.data_name}', ep, reses, False))
                         recall += reses['Recall'] * reses['tstNum']
                         ndcg += reses['NDCG'] * reses['tstNum']
@@ -77,7 +78,7 @@ class Exp:
                         best_ndcg = reses['NDCG']
                         best_ep = ep
                 self.save_history()
-            print()
+            print(f"best epoch:{best_ep}")
 
         for test_group_id in range(len(self.multi_handler.tst_handlers_group)):
             repeat_times = 5
@@ -144,40 +145,39 @@ class Exp:
         ep_loss, ep_preloss, ep_regloss = 0, 0, 0
         steps = len(trn_loader)
         tot_samp_num = 0
-        counter = [0] * len(self.multi_handler.trn_handlers)
-        reassign_steps = sum(list(map(lambda x: x.reproj_steps, self.multi_handler.trn_handlers)))
+        counter = [0] * len(self.multi_handler.trn_handlers) # Counts how many batches have already been processed for each training dataset
+        reassign_steps = sum(list(map(lambda x: x.reproj_steps, self.multi_handler.trn_handlers))) #3.3.1 reassign experts
         for i, batch_data in enumerate(trn_loader):
             if args.epoch_max_step > 0 and i >= args.epoch_max_step:
                 break
             ancs, poss, negs, dataset_id = batch_data
-            ancs = ancs[0].long()
-            poss = poss[0].long()
-            negs = negs[0].long()
+            ancs = ancs[0].long() #anchor
+            poss = poss[0].long() #positive sample
+            negs = negs[0].long() #negative sample
             dataset_id = dataset_id[0].long()
             tem_bar = self.multi_handler.trn_handlers[dataset_id].ratio_500_all
             if tem_bar < 1.0 and np.random.uniform() > tem_bar:
                 steps -= 1
                 continue
+            handler = self.multi_handler.trn_handlers[dataset_id]
+            feats = handler.projectors.to(args.devices[0])
 
             expert = self.model.summon(dataset_id)
-            opt = self.model.summon_opt(dataset_id)
-            feats = self.multi_handler.trn_handlers[dataset_id].projectors
             loss, loss_dict = expert.cal_loss((ancs, poss, negs), feats)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
 
-            sample_num = ancs.shape[0]
-            tot_samp_num += sample_num
-            ep_loss += loss.item() * sample_num
-            ep_preloss += loss_dict['preloss'].item() * sample_num
-            ep_regloss += loss_dict['regloss'].item()
-            log('Step %d/%d: loss = %.3f, pre = %.3f, reg = %.3f, pos = %.3f, neg = %.3f        ' % (i, steps, loss, loss_dict['preloss'], loss_dict['regloss'], loss_dict['posloss'], loss_dict['negloss']), save=False, oneline=True)
+            sample_num = ancs.shape[0] #batch size
+            tot_samp_num += sample_num # total sumple number in one epoch
+            ep_loss += loss.item() * sample_num #loss of one whole epoch
+            ep_preloss += loss_dict['preloss']* sample_num # prediction loss
+            ep_regloss += loss_dict['regloss'] # regularization loss
+
+            if counter[dataset_id] % 10 == 0:
+                log('Step %d/%d, total steps=%d: loss = %.3f, pre = %.3f, reg = %.3f, pos = %.3f, neg = %.3f' % (i, len(trn_loader),steps, loss, loss_dict['preloss'], loss_dict['regloss'], loss_dict['posloss'], loss_dict['negloss']), save=False, oneline=True)
 
             counter[dataset_id] += 1
-            if (counter[dataset_id] + 1) % self.multi_handler.trn_handlers[dataset_id].reproj_steps == 0:
+            if (counter[dataset_id] + 1) % self.multi_handler.trn_handlers[dataset_id].reproj_steps == 0: # 3.3.1 Recompute the projector(E1) once this dataset has trained `reproj_steps` batches.
                 self.multi_handler.trn_handlers[dataset_id].make_projectors()
-            if (i + 1) % reassign_steps == 0:
+            if (i + 1) % reassign_steps == 0: # reassign experts
                 self.model.assign_experts(self.multi_handler.trn_handlers, reca=True, log_assignment=False)
         ret = dict()
         ret['Loss'] = ep_loss / tot_samp_num
@@ -290,13 +290,21 @@ if __name__ == '__main__':
     datasets['others'] = [
         'ddi', 'ppa', 'proteins_spec0', 'proteins_spec1', 'proteins_spec2', 'proteins_spec3', 'email-Enron', 'web-Stanford', 'roadNet-PA', 'p2p-Gnutella06', 'soc-Epinions1'
     ]
+    '''
+    # 全部的
     datasets['link1'] = [
         'products_tech', 'yelp2018', 'yelp_textfeat', 'products_home', 'steam_textfeat', 'amazon_textfeat', 'amazon-book', 'citation-2019', 'citation-classic', 'pubmed', 'citeseer', 'ppa', 'p2p-Gnutella06', 'soc-Epinions1', 'email-Enron',
     ]
     datasets['link2'] = [
         'Photo', 'Goodreads', 'Fitness', 'ml1m', 'ml10m', 'gowalla', 'arxiv', 'arxiv-ta', 'cora', 'CS', 'collab', 'proteins_spec0', 'proteins_spec1', 'proteins_spec2', 'proteins_spec3', 'ddi', 'web-Stanford', 'roadNet-PA',
     ]
-
+    '''
+    datasets['link1'] = [
+        'yelp2018',
+    ]
+    datasets['link2'] = [
+        'Photo',
+    ]
     if args.dataset_setting in datasets.keys():
         trn_datasets = tst_datasets = datasets[args.dataset_setting]
     elif args.dataset_setting in datasets['all']:

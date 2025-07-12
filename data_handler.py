@@ -10,6 +10,7 @@ import torch_geometric.transforms as T
 from model import Feat_Projector, Adj_Projector, TopoEncoder
 import os
 
+
 class MultiDataHandler:
     def __init__(self, trn_datasets, tst_datasets_group):
         all_datasets = trn_datasets
@@ -31,15 +32,22 @@ class MultiDataHandler:
                 for i in range(len(tst_datasets_group)):
                     if data_name in tst_datasets_group[i]:
                         self.tst_handlers_group[i].append(handler)
-        self.make_joint_trn_loader()
-    
+        self.make_joint_trn_loader() # 3.3: cross domain model training,
+
+    # Create a joint DataLoader that mixes batches from all training datasets.
+    # Each dataset is split into batches of size `args.batch`.
+    # These batches are combined into a unified dataset (JointTrnData),
+    # where each sample index corresponds to a *full batch* from one original dataset.
+    # This allows multi-domain training: each iteration samples a batch from
+    # one dataset, while the overall DataLoader shuffles across all datasets' batches.
+    # (Note: DataLoader uses batch_size=1 because JointTrnData already returns a full batch.)
     def make_joint_trn_loader(self):
         loader_datasets = []
         for trn_handler in self.trn_handlers:
             tem_dataset = trn_handler.trn_loader.dataset
             loader_datasets.append(tem_dataset)
         joint_dataset = JointTrnData(loader_datasets)
-        self.joint_trn_loader = data.DataLoader(joint_dataset, batch_size=1, shuffle=True, num_workers=0)
+        self.joint_trn_loader = data.DataLoader(joint_dataset, batch_size=1, shuffle=True, num_workers=4,pin_memory=True)
     
     def remake_initial_projections(self):
         for i in range(len(self.trn_handlers)):
@@ -55,7 +63,7 @@ class DataHandler:
         self.load_data()
     
     def get_data_files(self):
-        predir = f'/home/user_name/data/zero-shot datasets/{self.data_name}/'
+        predir = f'zero-shot datasets/{self.data_name}/'
         if os.path.exists(predir + 'feats.pkl'):
             self.feat_file = predir + 'feats.pkl'
         else:
@@ -103,47 +111,61 @@ class DataHandler:
         row = (hash_vals - col).astype(np.int64) // args.node_num
         return row, col
 
-    def make_torch_adj(self, mat, unidirectional_for_asym=False):
-        if mat.shape[0] == mat.shape[1]:
-            _row = mat.row
-            _col = mat.col
-            row = np.concatenate([_row, _col]).astype(np.int64)
-            col = np.concatenate([_col, _row]).astype(np.int64)
-            row, col = self.unique_numpy(row, col)
-            data = np.ones_like(row)
-            mat = coo_matrix((data, (row, col)), mat.shape)
-            if args.selfloop == 1:
-                mat = (mat + sp.eye(mat.shape[0])) * 1.0
-            normed_asym_mat = self.normalize_adj(mat)
-            row = t.from_numpy(normed_asym_mat.row).long()
-            col = t.from_numpy(normed_asym_mat.col).long()
-            idxs = t.stack([row, col], dim=0)
-            vals = t.from_numpy(normed_asym_mat.data).float()
-            shape = t.Size(normed_asym_mat.shape)
-            asym_adj = t.sparse.FloatTensor(idxs, vals, shape)
-            return asym_adj
-        elif unidirectional_for_asym:
-            mat = (mat != 0) * 1.0
-            mat = self.normalize_adj(mat, log=True)
-            idxs = t.from_numpy(np.vstack([mat.row, mat.col]).astype(np.int64))
-            vals = t.from_numpy(mat.data.astype(np.float32))
-            shape = t.Size(mat.shape)
-            return t.sparse.FloatTensor(idxs, vals, shape)
-        else:
-            # make ui adj
-            a = sp.csr_matrix((args.user_num, args.user_num))
-            b = sp.csr_matrix((args.item_num, args.item_num))
-            mat = sp.vstack([sp.hstack([a, mat]), sp.hstack([mat.transpose(), b])])
-            mat = (mat != 0) * 1.0
-            if args.selfloop == 1:
-                mat = (mat + sp.eye(mat.shape[0])) * 1.0
-            mat = self.normalize_adj(mat)
+    def make_torch_adj(self,
+                       mat: sp.coo_matrix,
+                       *,
+                       unidirectional_for_asym: bool = False,
+                       keep_weight: bool = True,
+                       symmetrize: bool = False):
+        """
+        若 mat 不是方阵而且本次需要给 GNN（TopoEncoder / Light-GCN）使用，
+        先扩展成 UI 方阵，再做后续处理。
+        """
+        # ---------- (0) 把 item 端 id 复原 ----------
+        if mat.shape[0] != mat.shape[1]:  # 二分图
+            user_num, item_num = mat.shape
+            if mat.col.min() >= user_num:  # item 整体平移过
+                mat.col -= user_num  # 只改 col！
+        else:  # 方阵
+            if mat.row.max() >= mat.shape[0]:
+                raise ValueError(f'{self.data_name}: node id 超界')
 
-            # make cuda tensor
-            idxs = t.from_numpy(np.vstack([mat.row, mat.col]).astype(np.int64))
-            vals = t.from_numpy(mat.data.astype(np.float32))
-            shape = t.Size(mat.shape)
-            return t.sparse.FloatTensor(idxs, vals, shape)
+        # ---------- (1) 如有必要，先拼 UI 方阵 ----------
+        if mat.shape[0] != mat.shape[1] and not unidirectional_for_asym:
+            user_num, item_num = mat.shape
+            zeroUU = sp.csr_matrix((user_num, user_num), dtype=mat.dtype)
+            zeroII = sp.csr_matrix((item_num, item_num), dtype=mat.dtype)
+            mat_ui = sp.vstack([sp.hstack([zeroUU, mat]),
+                                sp.hstack([mat.transpose(), zeroII])]).tocoo()
+            # 再继续用下方“方阵”代码处理
+            mat = mat_ui
+
+        # ---------- (2) 若要求对称化 ----------
+        if symmetrize:
+            row = np.concatenate([mat.row, mat.col])
+            col = np.concatenate([mat.col, mat.row])
+            dat = np.concatenate([mat.data, mat.data]) if keep_weight \
+                else np.ones(2 * mat.nnz, dtype=np.float32)
+        else:
+            row, col = mat.row, mat.col
+            dat = mat.data if keep_weight else np.ones_like(mat.data)
+
+        # 去重
+        uniq, idx = np.unique(row * mat.shape[1] + col, return_index=True)
+        row, col, dat = row[idx], col[idx], dat[idx]
+
+        # ---------- (3) 可选归一化（只有对称化 + 无向 LightGCN 时才做） ----------
+        if symmetrize and (not unidirectional_for_asym):
+            deg = np.bincount(row, weights=np.abs(dat),
+                              minlength=mat.shape[0]).astype(np.float32)
+            deg_inv_sqrt = np.power(deg, -0.5, where=deg > 0)
+            dat = dat * deg_inv_sqrt[row] * deg_inv_sqrt[col]
+
+        # ---------- (4) 转 torch sparse ----------
+        idxs = t.tensor([row, col], dtype=t.long)
+        vals = t.tensor(dat, dtype=t.float32)
+        shape = t.Size(mat.shape)
+        return t.sparse_coo_tensor(idxs, vals, shape)
 
     def load_data(self):
         tst_mat = self.load_one_file(self.tstfile)
@@ -167,11 +189,11 @@ class DataHandler:
             print('Dataset: {data_name}, Node num: {node_num}, Edge num: {edge_num}'.format(data_name=self.data_name, node_num=args.node_num, edge_num=trn_mat.nnz+val_mat.nnz+tst_mat.nnz))
         if args.tst_mode == 'tst':
             tst_data = TstData(tst_mat, trn_mat)
-            self.tst_loader = data.DataLoader(tst_data, batch_size=args.tst_batch, shuffle=False, num_workers=0)
+            self.tst_loader = data.DataLoader(tst_data, batch_size=args.tst_batch, shuffle=False, num_workers=4,pin_memory=True)
             self.tst_input_adj = self.make_torch_adj(trn_mat)
         elif args.tst_mode == 'val':
             tst_data = TstData(val_mat, trn_mat)
-            self.tst_loader = data.DataLoader(tst_data, batch_size=args.tst_batch, shuffle=False, num_workers=0)
+            self.tst_loader = data.DataLoader(tst_data, batch_size=args.tst_batch, shuffle=False, num_workers=4,pin_memory=True)
             self.tst_input_adj = self.make_torch_adj(fewshot_mat)
         else:
             raise Exception('Specify proper test mode')
@@ -179,7 +201,7 @@ class DataHandler:
         if args.trn_mode == 'fewshot':
             self.trn_mat = fewshot_mat
             trn_data = TrnData(self.trn_mat)
-            self.trn_loader = data.DataLoader(trn_data, batch_size=args.batch, shuffle=True, num_workers=0)
+            self.trn_loader = data.DataLoader(trn_data, batch_size=args.batch, shuffle=True, num_workers=4,pin_memory=True)
             self.trn_input_adj = self.make_torch_adj(fewshot_mat)
             if args.tst_mode == 'val':
                 self.trn_input_adj = self.tst_input_adj
@@ -188,7 +210,7 @@ class DataHandler:
         elif args.trn_mode == 'train-all':
             self.trn_mat = trn_mat
             trn_data = TrnData(self.trn_mat)
-            self.trn_loader = data.DataLoader(trn_data, batch_size=args.batch, shuffle=True, num_workers=0)
+            self.trn_loader = data.DataLoader(trn_data, batch_size=args.batch, shuffle=True, num_workers=4,pin_memory=True)
             if args.tst_mode == 'tst':
                 self.trn_input_adj = self.tst_input_adj
             else:
@@ -203,6 +225,11 @@ class DataHandler:
         self.make_projectors()
         self.reproj_steps = max(len(self.trn_loader.dataset) // (10 * args.batch), args.proj_trn_steps)
         self.ratio_500_all = 500 / len(self.trn_loader)
+
+        # expose edge_index / edge_weight to MSGNN expert
+        coo_adj = self.asym_adj.coalesce()
+        self.edge_index = coo_adj.indices().to(t.long)  # [2, E]
+        self.edge_weight = coo_adj.values().to(t.float)  # [E]
     
     def make_projectors(self):
         with t.no_grad():

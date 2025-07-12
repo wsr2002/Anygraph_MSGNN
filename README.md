@@ -1,3 +1,32 @@
+To train:
+```--dataset_setting
+link2+link1
+--save_path
+pretrain_link2_MSGNN
+--nn
+msgnn
+--expert_num
+8
+--q
+0.25
+--K
+2
+--hidden
+4
+--num_layers
+1
+--trainable_q
+--dropout
+0.3
+--normalization
+sym
+--reg
+1e-7
+```
+
+
+
+-------------------------------------------------------------------------------------------------------
 <h1 align='center'>AnyGraph: Graph Foundation Model in the Wild</h1>
 
 <div align='center'>
