@@ -8,3 +8,5 @@ Models/
 zero-shot datasets/
 .gitignore
 node_classification/
+README_old.md
+imgs/
